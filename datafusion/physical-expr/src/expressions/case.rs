@@ -1424,14 +1424,14 @@ mod tests {
     use super::*;
 
     use crate::expressions;
-    use crate::expressions::{BinaryExpr, binary, cast, col, is_not_null, lit};
+    use crate::expressions::{BinaryExpr, binary, cast, col, is_not_null};
     use arrow::buffer::Buffer;
     use arrow::datatypes::DataType::Float64;
     use arrow::datatypes::Field;
     use datafusion_common::cast::{as_float64_array, as_int32_array};
     use datafusion_common::plan_err;
     use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-    use datafusion_expr::type_coercion::binary::comparison_coercion;
+    use datafusion_expr::type_coercion::binary::type_union_coercion;
     use datafusion_expr_common::operator::Operator;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
     use half::f16;
@@ -2279,7 +2279,7 @@ mod tests {
             make_lit_i32(250),
         ));
         let expr = CaseExpr::try_new(None, vec![(predicate, make_col("c2", 1))], None)?;
-        assert!(matches!(expr.eval_method, EvalMethod::InfallibleExprOrNull));
+        assert_eq!(expr.eval_method, EvalMethod::InfallibleExprOrNull);
         match expr.evaluate(&batch)? {
             ColumnarValue::Array(array) => {
                 assert_eq!(1000, array.len());
@@ -2381,9 +2381,7 @@ mod tests {
         thens_type
             .iter()
             .try_fold(else_type, |left_type, right_type| {
-                // TODO: now just use the `equal` coercion rule for case when. If find the issue, and
-                // refactor again.
-                comparison_coercion(&left_type, right_type)
+                type_union_coercion(&left_type, right_type)
             })
     }
 

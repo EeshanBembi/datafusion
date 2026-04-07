@@ -64,15 +64,13 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let alias_generator = AliasGenerator::new();
         let plan = plan
-            .transform_up(|plan| {
-                match plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
-                    None => Ok(Transformed::no(plan)),
-                    Some(hash_join) => try_push_down_join_filter(
-                        Arc::clone(&plan),
-                        hash_join,
-                        &alias_generator,
-                    ),
-                }
+            .transform_up(|plan| match plan.downcast_ref::<NestedLoopJoinExec>() {
+                None => Ok(Transformed::no(plan)),
+                Some(hash_join) => try_push_down_join_filter(
+                    Arc::clone(&plan),
+                    hash_join,
+                    &alias_generator,
+                ),
             })
             .map(|t| t.data)?;
 
@@ -135,7 +133,7 @@ fn try_push_down_join_filter(
     );
 
     let new_lhs_length = lhs_rewrite.data.0.schema().fields.len();
-    let projections = match projections {
+    let projections = match projections.as_ref() {
         None => match join.join_type() {
             JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
                 // Build projections that ignore the newly projected columns.

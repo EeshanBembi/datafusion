@@ -29,12 +29,11 @@ use super::{
 use crate::column_rewriter::PhysicalColumnRewriter;
 use crate::execution_plan::CardinalityEffect;
 use crate::filter_pushdown::{
-    ChildFilterDescription, ChildPushdownResult, FilterColumnChecker, FilterDescription,
-    FilterPushdownPhase, FilterPushdownPropagation, PushedDownPredicate,
+    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation, FilterRemapper, PushedDownPredicate,
 };
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
-use crate::{DisplayFormatType, ExecutionPlan, PhysicalExpr};
-use std::any::Any;
+use crate::{DisplayFormatType, ExecutionPlan, PhysicalExpr, check_if_same_properties};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,7 +50,6 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::ExpressionPlacement;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::projection::Projector;
-use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, LexRequirement, PhysicalSortExpr,
@@ -79,7 +77,7 @@ pub struct ProjectionExec {
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Cache holding plan properties like equivalences, output partitioning etc.
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl ProjectionExec {
@@ -138,13 +136,19 @@ impl ProjectionExec {
         E: Into<ProjectionExpr>,
     {
         let input_schema = input.schema();
-        // convert argument to Vec<ProjectionExpr>
-        let expr_vec = expr.into_iter().map(Into::into).collect::<Vec<_>>();
-        let projection = ProjectionExprs::new(expr_vec);
+        let expr_arc = expr.into_iter().map(Into::into).collect::<Arc<_>>();
+        let projection = ProjectionExprs::from_expressions(expr_arc);
         let projector = projection.make_projector(&input_schema)?;
+        Self::try_from_projector(projector, input)
+    }
 
+    fn try_from_projector(
+        projector: Projector,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Self> {
         // Construct a map from the input expressions to the output expression of the Projection
-        let projection_mapping = projection.projection_mapping(&input_schema)?;
+        let projection_mapping =
+            projector.projection().projection_mapping(&input.schema())?;
         let cache = Self::compute_properties(
             &input,
             &projection_mapping,
@@ -154,7 +158,7 @@ impl ProjectionExec {
             projector,
             input,
             metrics: ExecutionPlanMetricsSet::new(),
-            cache,
+            cache: Arc::new(cache),
         })
     }
 
@@ -217,6 +221,17 @@ impl ProjectionExec {
         }
         Ok(alias_map)
     }
+
+    fn with_new_children_and_same_properties(
+        &self,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
+        Self {
+            input: children.swap_remove(0),
+            metrics: ExecutionPlanMetricsSet::new(),
+            ..Self::clone(self)
+        }
+    }
 }
 
 impl DisplayAs for ProjectionExec {
@@ -266,11 +281,7 @@ impl ExecutionPlan for ProjectionExec {
     }
 
     /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -301,12 +312,24 @@ impl ExecutionPlan for ProjectionExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        let mut tnr = TreeNodeRecursion::Continue;
+        for proj_expr in self.projector.projection().as_ref().iter() {
+            tnr = tnr.visit_sibling(|| f(proj_expr.expr.as_ref()))?;
+        }
+        Ok(tnr)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        ProjectionExec::try_new(
-            self.projector.projection().clone(),
+        check_if_same_properties!(self, children);
+        ProjectionExec::try_from_projector(
+            self.projector.clone(),
             children.swap_remove(0),
         )
         .map(|p| Arc::new(p) as _)
@@ -336,16 +359,15 @@ impl ExecutionPlan for ProjectionExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        self.partition_statistics(None)
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        let input_stats = self.input.partition_statistics(partition)?;
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let input_stats =
+            Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
         let output_schema = self.schema();
-        self.projector
-            .projection()
-            .project_statistics(input_stats, &output_schema)
+        Ok(Arc::new(
+            self.projector
+                .projection()
+                .project_statistics(input_stats, &output_schema)?,
+        ))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -378,22 +400,19 @@ impl ExecutionPlan for ProjectionExec {
         // expand alias column to original expr in parent filters
         let invert_alias_map = self.collect_reverse_alias()?;
         let output_schema = self.schema();
-        let checker = FilterColumnChecker::new(&output_schema);
+        let remapper = FilterRemapper::new(output_schema);
         let mut child_parent_filters = Vec::with_capacity(parent_filters.len());
 
         for filter in parent_filters {
-            if !checker.can_pushdown(&filter) {
+            // Check that column exists in child, then reassign column indices to match child schema
+            if let Some(reassigned) = remapper.try_remap(&filter)? {
+                // rewrite filter expression using invert alias map
+                let mut rewriter = PhysicalColumnRewriter::new(&invert_alias_map);
+                let rewritten = reassigned.rewrite(&mut rewriter)?.data;
+                child_parent_filters.push(PushedDownPredicate::supported(rewritten));
+            } else {
                 child_parent_filters.push(PushedDownPredicate::unsupported(filter));
-                continue;
             }
-            // All columns exist in child - we can push down
-            // Need to reassign column indices to match child schema
-            let reassigned_filter = reassign_expr_columns(filter, &output_schema)?;
-            // rewrite filter expression using invert alias map
-            let mut rewriter = PhysicalColumnRewriter::new(&invert_alias_map);
-            let rewritten = reassigned_filter.rewrite(&mut rewriter)?.data;
-
-            child_parent_filters.push(PushedDownPredicate::supported(rewritten));
         }
 
         Ok(FilterDescription::new().with_child(ChildFilterDescription {
@@ -547,6 +566,15 @@ impl RecordBatchStream for ProjectionStream {
     }
 }
 
+/// Trait for execution plans that can embed a projection, avoiding a separate
+/// [`ProjectionExec`] wrapper.
+///
+/// # Empty projections
+///
+/// `Some(vec![])` is a valid projection that produces zero output columns while
+/// preserving the correct row count. Implementors must ensure that runtime batch
+/// construction still returns batches with the right number of rows even when no
+/// columns are selected (e.g. for `SELECT count(1) … JOIN …`).
 pub trait EmbeddedProjection: ExecutionPlan + Sized {
     fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self>;
 }
@@ -557,6 +585,15 @@ pub fn try_embed_projection<Exec: EmbeddedProjection + 'static>(
     projection: &ProjectionExec,
     execution_plan: &Exec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    // If the projection has no expressions at all (e.g., ProjectionExec: expr=[]),
+    // embed an empty projection into the execution plan so it outputs zero columns.
+    // This avoids allocating throwaway null arrays for build-side columns
+    // when no output columns are actually needed (e.g., count(1) over a right join).
+    if projection.expr().is_empty() {
+        let new_execution_plan = Arc::new(execution_plan.with_projection(Some(vec![]))?);
+        return Ok(Some(new_execution_plan));
+    }
+
     // Collect all column indices from the given projection expressions.
     let projection_index = collect_column_indices(projection.expr());
 
@@ -564,13 +601,7 @@ pub fn try_embed_projection<Exec: EmbeddedProjection + 'static>(
         return Ok(None);
     };
 
-    // If the projection indices is the same as the input columns, we don't need to embed the projection to hash join.
-    // Check the projection_index is 0..n-1 and the length of projection_index is the same as the length of execution_plan schema fields.
-    if projection_index.len() == projection_index.last().unwrap() + 1
-        && projection_index.len() == execution_plan.schema().fields().len()
-    {
-        return Ok(None);
-    }
+    let columns_reduced = projection_index.len() < execution_plan.schema().fields().len();
 
     let new_execution_plan =
         Arc::new(execution_plan.with_projection(Some(projection_index.to_vec()))?);
@@ -605,9 +636,16 @@ pub fn try_embed_projection<Exec: EmbeddedProjection + 'static>(
         Arc::clone(&new_execution_plan) as _,
     )?);
     if is_projection_removable(&new_projection) {
+        // Residual is identity — embedding fully absorbed the projection.
         Ok(Some(new_execution_plan))
-    } else {
+    } else if columns_reduced {
+        // Embedding reduced columns even though a residual is still needed
+        // for renames or expressions — worth keeping.
         Ok(Some(new_projection))
+    } else {
+        // No columns eliminated and residual still needed — embedding just
+        // adds an unnecessary column reorder inside the operator.
+        Ok(None)
     }
 }
 
@@ -689,20 +727,19 @@ pub fn try_pushdown_through_join(
 pub fn remove_unnecessary_projections(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let maybe_modified =
-        if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
-            // If the projection does not cause any change on the input, we can
-            // safely remove it:
-            if is_projection_removable(projection) {
-                return Ok(Transformed::yes(Arc::clone(projection.input())));
-            }
-            // If it does, check if we can push it under its child(ren):
-            projection
-                .input()
-                .try_swapping_with_projection(projection)?
-        } else {
-            return Ok(Transformed::no(plan));
-        };
+    let maybe_modified = if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        // If the projection does not cause any change on the input, we can
+        // safely remove it:
+        if is_projection_removable(projection) {
+            return Ok(Transformed::yes(Arc::clone(projection.input())));
+        }
+        // If it does, check if we can push it under its child(ren):
+        projection
+            .input()
+            .try_swapping_with_projection(projection)?
+    } else {
+        return Ok(Transformed::no(plan));
+    };
     Ok(maybe_modified.map_or_else(|| Transformed::no(plan), Transformed::yes))
 }
 
@@ -1037,15 +1074,37 @@ fn try_unifying_projections(
 
 /// Collect all column indices from the given projection expressions.
 fn collect_column_indices(exprs: &[ProjectionExpr]) -> Vec<usize> {
-    // Collect indices and remove duplicates.
-    let mut indices = exprs
-        .iter()
-        .flat_map(|proj_expr| collect_columns(&proj_expr.expr))
-        .map(|x| x.index())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    indices.sort();
+    // Collect column indices in a deterministic order that preserves the
+    // projection's column ordering. For simple Column expressions, we use
+    // the column index directly. For complex expressions, we walk the
+    // expression tree to collect column references in traversal order.
+    // This allows the embedded projection to match the desired output
+    // column order, avoiding a residual ProjectionExec.
+    let mut seen = std::collections::HashSet::new();
+    let mut indices = Vec::new();
+    for proj_expr in exprs {
+        if let Some(col) = proj_expr.expr.as_any().downcast_ref::<Column>() {
+            // Simple column reference: preserve projection order.
+            if seen.insert(col.index()) {
+                indices.push(col.index());
+            }
+        } else {
+            // Complex expression: collect all referenced columns in
+            // expression tree traversal order (deterministic) to preserve
+            // the natural ordering of column references.
+            proj_expr
+                .expr
+                .apply(|expr| {
+                    if let Some(col) = expr.as_any().downcast_ref::<Column>()
+                        && seen.insert(col.index())
+                    {
+                        indices.push(col.index());
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("closure always returns OK");
+        }
+    }
     indices
 }
 
@@ -1128,7 +1187,6 @@ fn new_columns_for_join_on(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use crate::common::collect;
 
@@ -1160,7 +1218,8 @@ mod tests {
             expr,
             alias: "b-(1+a)".to_string(),
         }]);
-        assert_eq!(column_indices, vec![1, 7]);
+        // Tree traversal order: b@7 is visited before a@1
+        assert_eq!(column_indices, vec![7, 1]);
         Ok(())
     }
 
