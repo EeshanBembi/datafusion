@@ -1,0 +1,49 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::types::extension::DFExtensionType;
+use arrow::datatypes::{DataType, Field, Fields};
+use arrow_schema::extension::ExtensionType;
+
+/// Defines the extension type logic for the canonical `arrow.variable_shape_tensor` extension type.
+///
+/// Variable shape tensors are stored as `Struct` arrays containing `data` (a list of elements)
+/// and `shape` (a fixed-size list of int32 dimensions). The default Arrow formatter is used
+/// for display.
+///
+/// See [`DFExtensionType`] for information on DataFusion's extension type mechanism.
+impl DFExtensionType for arrow_schema::extension::VariableShapeTensor {
+    fn storage_type(&self) -> DataType {
+        let dims = i32::try_from(self.dimensions()).expect("dimensions overflow");
+        DataType::Struct(Fields::from_iter([
+            Field::new_list(
+                "data",
+                Field::new_list_field(self.value_type().clone(), false),
+                false,
+            ),
+            Field::new(
+                "shape",
+                DataType::new_fixed_size_list(DataType::Int32, dims, false),
+                false,
+            ),
+        ]))
+    }
+
+    fn serialize_metadata(&self) -> Option<String> {
+        <arrow_schema::extension::VariableShapeTensor as ExtensionType>::serialize_metadata(self)
+    }
+}
