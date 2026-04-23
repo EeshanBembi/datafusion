@@ -21,22 +21,25 @@ use datafusion_common::{Result, exec_datafusion_err, internal_err};
 
 use arrow::array::{
     Array, ArrayAccessor, ArrayDataBuilder, BinaryArray, ByteView, LargeStringArray,
-    NullBufferBuilder, StringArray, StringViewArray, StringViewBuilder, make_view,
+    StringArray, StringViewArray, make_view,
 };
-use arrow::buffer::{MutableBuffer, NullBuffer};
+use arrow::buffer::{Buffer, MutableBuffer, NullBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 
-/// Optimized version of the StringBuilder in Arrow that:
-/// 1. Precalculating the expected length of the result, avoiding reallocations.
-/// 2. Avoids creating / incrementally creating a `NullBufferBuilder`
-pub struct StringArrayBuilder {
+/// Builder used by `concat`/`concat_ws` to assemble a [`StringArray`] one row
+/// at a time from multiple input columns.
+///
+/// Each row is written via repeated `write` calls, followed by a single
+/// `append_offset` call to commit the row. The output null buffer is supplied
+/// by the caller at `finish` time.
+pub(crate) struct ConcatStringBuilder {
     offsets_buffer: MutableBuffer,
     value_buffer: MutableBuffer,
     /// If true, a safety check is required during the `finish` call
     tainted: bool,
 }
 
-impl StringArrayBuilder {
+impl ConcatStringBuilder {
     pub fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self {
         let capacity = item_capacity
             .checked_add(1)
@@ -106,13 +109,14 @@ impl StringArrayBuilder {
         }
     }
 
-    pub fn append_offset(&mut self) {
+    pub fn append_offset(&mut self) -> Result<()> {
         let next_offset: i32 = self
             .value_buffer
             .len()
             .try_into()
-            .expect("byte array offset overflow");
+            .map_err(|_| exec_datafusion_err!("byte array offset overflow"))?;
         self.offsets_buffer.push(next_offset);
+        Ok(())
     }
 
     /// Finalize the builder into a concrete [`StringArray`].
@@ -150,18 +154,25 @@ impl StringArrayBuilder {
     }
 }
 
-pub struct StringViewArrayBuilder {
-    builder: StringViewBuilder,
+/// Builder used by `concat`/`concat_ws` to assemble a [`StringViewArray`] one
+/// row at a time from multiple input columns.
+///
+/// Each row is written via repeated `write` calls, followed by a single
+/// `append_offset` call to commit the row as a single string view. The output
+/// null buffer is supplied by the caller at `finish` time.
+pub(crate) struct ConcatStringViewBuilder {
+    views: Vec<u128>,
+    data: Vec<u8>,
     block: Vec<u8>,
     /// If true, a safety check is required during the `append_offset` call
     tainted: bool,
 }
 
-impl StringViewArrayBuilder {
-    pub fn with_capacity(item_capacity: usize, _data_capacity: usize) -> Self {
-        let builder = StringViewBuilder::with_capacity(item_capacity);
+impl ConcatStringViewBuilder {
+    pub fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self {
         Self {
-            builder,
+            views: Vec::with_capacity(item_capacity),
+            data: Vec::with_capacity(data_capacity),
             block: vec![],
             tainted: false,
         }
@@ -214,16 +225,29 @@ impl StringViewArrayBuilder {
         }
     }
 
+    /// Finalizes the current row by converting the accumulated data into a
+    /// StringView and appending it to the views buffer.
     pub fn append_offset(&mut self) -> Result<()> {
-        let block_str = if self.tainted {
+        if self.tainted {
             std::str::from_utf8(&self.block)
-                .map_err(|_| exec_datafusion_err!("invalid UTF-8 in binary literal"))?
+                .map_err(|_| exec_datafusion_err!("invalid UTF-8 in binary literal"))?;
+        }
+
+        let v = &self.block;
+        if v.len() > 12 {
+            let offset: u32 = self
+                .data
+                .len()
+                .try_into()
+                .map_err(|_| exec_datafusion_err!("byte array offset overflow"))?;
+            self.data.extend_from_slice(v);
+            self.views.push(make_view(v, 0, offset));
         } else {
-            // SAFETY: all data that was appended was valid UTF8
-            unsafe { std::str::from_utf8_unchecked(&self.block) }
-        };
-        self.builder.append_value(block_str);
+            self.views.push(make_view(v, 0, 0));
+        }
+
         self.block.clear();
+        self.tainted = false;
         Ok(())
     }
 
@@ -233,32 +257,49 @@ impl StringViewArrayBuilder {
     ///
     /// Returns an error when:
     ///
-    /// - the provided `null_buffer` does not match amount of `append_offset` calls.
-    pub fn finish(mut self, null_buffer: Option<NullBuffer>) -> Result<StringViewArray> {
-        let array = self.builder.finish();
-        match null_buffer {
-            Some(nulls) if nulls.len() != array.len() => {
-                internal_err!("Null buffer and views buffer must be the same length")
-            }
-            Some(nulls) => {
-                let array_builder = array.into_data().into_builder().nulls(Some(nulls));
-                // SAFETY: the underlying data is valid; we are only adding a null buffer
-                let array_data = unsafe { array_builder.build_unchecked() };
-                Ok(StringViewArray::from(array_data))
-            }
-            None => Ok(array),
+    /// - the provided `null_buffer` length does not match the row count.
+    pub fn finish(self, null_buffer: Option<NullBuffer>) -> Result<StringViewArray> {
+        if let Some(ref nulls) = null_buffer
+            && nulls.len() != self.views.len()
+        {
+            return internal_err!(
+                "Null buffer length ({}) must match row count ({})",
+                nulls.len(),
+                self.views.len()
+            );
         }
+
+        let buffers: Vec<Buffer> = if self.data.is_empty() {
+            vec![]
+        } else {
+            vec![Buffer::from(self.data)]
+        };
+
+        // SAFETY: views were constructed with correct lengths, offsets, and
+        // prefixes. UTF-8 validity was checked in append_offset() for any row
+        // where tainted data (e.g., binary literals) was appended.
+        let array = unsafe {
+            StringViewArray::new_unchecked(
+                ScalarBuffer::from(self.views),
+                buffers,
+                null_buffer,
+            )
+        };
+        Ok(array)
     }
 }
 
-pub struct LargeStringArrayBuilder {
+/// Builder used by `concat`/`concat_ws` to assemble a [`LargeStringArray`] one
+/// row at a time from multiple input columns. See [`ConcatStringBuilder`] for
+/// details on the row-composition contract.
+pub(crate) struct ConcatLargeStringBuilder {
     offsets_buffer: MutableBuffer,
     value_buffer: MutableBuffer,
     /// If true, a safety check is required during the `finish` call
     tainted: bool,
 }
 
-impl LargeStringArrayBuilder {
+impl ConcatLargeStringBuilder {
     pub fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self {
         let capacity = item_capacity
             .checked_add(1)
@@ -328,13 +369,14 @@ impl LargeStringArrayBuilder {
         }
     }
 
-    pub fn append_offset(&mut self) {
+    pub fn append_offset(&mut self) -> Result<()> {
         let next_offset: i64 = self
             .value_buffer
             .len()
             .try_into()
-            .expect("byte array offset overflow");
+            .map_err(|_| exec_datafusion_err!("byte array offset overflow"))?;
         self.offsets_buffer.push(next_offset);
+        Ok(())
     }
 
     /// Finalize the builder into a concrete [`LargeStringArray`].
@@ -372,7 +414,9 @@ impl LargeStringArrayBuilder {
     }
 }
 
-/// Append a new view to the views buffer with the given substr
+/// Append a new view to the views buffer with the given substr.
+///
+/// Callers are responsible for their own null tracking.
 ///
 /// # Safety
 ///
@@ -381,13 +425,15 @@ impl LargeStringArrayBuilder {
 ///
 /// # Arguments
 /// - views_buffer: The buffer to append the new view to
-/// - null_builder: The buffer to append the null value to
 /// - original_view: The original view value
 /// - substr: The substring to append. Must be a valid substring of the original view
 /// - start_offset: The start offset of the substring in the view
-pub fn make_and_append_view(
+///
+/// LLVM is apparently overly eager to inline this function into some hot loops,
+/// which bloats them and regresses performance, so we disable inlining for now.
+#[inline(never)]
+pub(crate) fn append_view(
     views_buffer: &mut Vec<u128>,
-    null_builder: &mut NullBufferBuilder,
     original_view: &u128,
     substr: &str,
     start_offset: u32,
@@ -401,15 +447,13 @@ pub fn make_and_append_view(
             view.offset + start_offset,
         )
     } else {
-        // inline value does not need block id or offset
         make_view(substr.as_bytes(), 0, 0)
     };
     views_buffer.push(sub_view);
-    null_builder.append_non_null();
 }
 
 #[derive(Debug)]
-pub enum ColumnarValueRef<'a> {
+pub(crate) enum ColumnarValueRef<'a> {
     Scalar(&'a [u8]),
     NullableArray(&'a StringArray),
     NonNullableArray(&'a StringArray),
@@ -459,13 +503,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "capacity integer overflow")]
-    fn test_overflow_string_array_builder() {
-        let _builder = StringArrayBuilder::with_capacity(usize::MAX, usize::MAX);
+    fn test_overflow_concat_string_builder() {
+        let _builder = ConcatStringBuilder::with_capacity(usize::MAX, usize::MAX);
     }
 
     #[test]
     #[should_panic(expected = "capacity integer overflow")]
-    fn test_overflow_large_string_array_builder() {
-        let _builder = LargeStringArrayBuilder::with_capacity(usize::MAX, usize::MAX);
+    fn test_overflow_concat_large_string_builder() {
+        let _builder = ConcatLargeStringBuilder::with_capacity(usize::MAX, usize::MAX);
     }
 }
